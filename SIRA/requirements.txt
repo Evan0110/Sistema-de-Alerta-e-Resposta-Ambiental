@@ -5,3 +5,4 @@ folium>=0.16,<1.0
 streamlit-folium>=0.20,<1.1
 plotly>=5.20,<7.0
 pandas>=2.0,<3.0
+supabase>=2.0,<3.0
