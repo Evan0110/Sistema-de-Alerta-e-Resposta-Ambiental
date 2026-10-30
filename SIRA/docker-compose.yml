@@ -1,0 +1,14 @@
+services:
+  sira:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      SIRA_API_URL: http://127.0.0.1:5000/api
+      SIRA_DB_PATH: /app/data/sira_dados.db
+    volumes:
+      - sira-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  sira-data:

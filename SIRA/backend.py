@@ -11,9 +11,14 @@ app.config["JSON_SORT_KEYS"] = False
 RISK_TYPES = {"Enchente", "Deslizamento", "Queimada", "Seca", "Qualidade do Ar", "Contaminação de Água"}
 SEVERITIES = {"Emergência", "Alerta", "Atenção"}
 ROLES = {"Cidadão / Morador", "Agente de Defesa Civil", "Estudante / Pesquisador", "Gestor Público"}
+PERSONAS = {"Operador", "Público geral"}
 ALERT_FIELDS = ("title", "risk_type", "severity", "location", "lat", "lng", "issuer", "description", "instructions", "date_time")
 
 class ValidationError(ValueError):
+    pass
+
+
+class ConflictError(ValueError):
     pass
 
 
@@ -74,6 +79,50 @@ def validate_alert(data):
     return result
 
 
+def create_alert_record(data):
+    return database.insert_alert(validate_alert(data))
+
+
+def create_participant_record(data):
+    participant = {
+        "name": required_text(data, "name", "nome", 120),
+        "email": required_text(data, "email", "e-mail", 254).lower(),
+        "organization": required_text(data, "organization", "instituição/comunidade", 200),
+        "role": required_text(data, "role", "perfil", 80),
+    }
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", participant["email"]):
+        raise ValidationError("Informe um endereço de e-mail válido.")
+    if participant["role"] not in ROLES:
+        raise ValidationError("Perfil de agente inválido.")
+    try:
+        return database.register_participant(participant)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "unique constraint failed" in message or "duplicate key value violates unique constraint" in message:
+            raise ConflictError("Este e-mail já está cadastrado.") from exc
+        raise
+
+
+def create_feedback_record(data):
+    feedback = {
+        "participant_name": required_text(data, "participant_name", "nome", 120),
+        "persona": required_text(data, "persona", "perfil testado", 40),
+        "usability_rating": data.get("usability_rating"),
+        "clarity_rating": data.get("clarity_rating"),
+        "comments": data.get("comments", ""),
+    }
+    if feedback["persona"] not in PERSONAS:
+        raise ValidationError("Perfil de teste inválido.")
+    for key in ("usability_rating", "clarity_rating"):
+        value = feedback[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+            raise ValidationError(f"'{key}' deve ser um número inteiro entre 1 e 5.")
+    if not isinstance(feedback["comments"], str):
+        raise ValidationError("O campo 'comments' deve ser texto.")
+    feedback["comments"] = feedback["comments"].strip()[:2000]
+    return database.insert_feedback(feedback)
+
+
 def handle_validation(func):
     """Transforma erros de validação em respostas 400 claras."""
     from functools import wraps
@@ -103,8 +152,7 @@ def get_alerts():
 @app.post("/api/alerts")
 @handle_validation
 def post_alert():
-    data = validate_alert(json_body())
-    created = database.insert_alert(data)
+    created = create_alert_record(json_body())
     return jsonify(created), 201
 
 @app.get("/api/indicators")
@@ -114,23 +162,13 @@ def indicators():
 @app.post("/api/extension/register")
 @handle_validation
 def register_extension():
-    data = json_body()
-    participant = {
-        "name": required_text(data, "name", "nome", 120),
-        "email": required_text(data, "email", "e-mail", 254).lower(),
-        "organization": required_text(data, "organization", "instituição/comunidade", 200),
-        "role": required_text(data, "role", "perfil", 80),
-    }
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", participant["email"]):
-        raise ValidationError("Informe um endereço de e-mail válido.")
-    if participant["role"] not in ROLES:
-        raise ValidationError("Perfil de agente inválido.")
     try:
-        participant_id = database.register_participant(participant)
-    except Exception as exc:
-        # A mensagem externa não revela detalhes internos do banco.
-        if "UNIQUE constraint failed" in str(exc):
-            return jsonify({"error": "Este e-mail já está cadastrado."}), 409
+        participant_id = create_participant_record(json_body())
+    except ConflictError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except ValidationError:
+        raise
+    except Exception:
         app.logger.exception("Falha ao registrar participante")
         return jsonify({"error": "Não foi possível registrar a inscrição."}), 500
     return jsonify({"message": "Inscrição registrada.", "id": participant_id}), 201
@@ -138,21 +176,7 @@ def register_extension():
 @app.post("/api/extension/feedback")
 @handle_validation
 def extension_feedback():
-    data = json_body()
-    feedback = {
-        "participant_name": required_text(data, "participant_name", "nome", 120),
-        "usability_rating": data.get("usability_rating"),
-        "clarity_rating": data.get("clarity_rating"),
-        "comments": data.get("comments", ""),
-    }
-    for key in ("usability_rating", "clarity_rating"):
-        value = feedback[key]
-        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
-            raise ValidationError(f"'{key}' deve ser um número inteiro entre 1 e 5.")
-    if not isinstance(feedback["comments"], str):
-        raise ValidationError("O campo 'comments' deve ser texto.")
-    feedback["comments"] = feedback["comments"].strip()[:2000]
-    feedback_id = database.insert_feedback(feedback)
+    feedback_id = create_feedback_record(json_body())
     return jsonify({"message": "Feedback registrado.", "id": feedback_id}), 201
 
 @app.errorhandler(404)

@@ -5,10 +5,39 @@ O banco é criado em uma localização estável junto a este arquivo, não no
 """
 from pathlib import Path
 import sqlite3
+import os
+from functools import lru_cache
 from contextlib import contextmanager
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "sira_dados.db"
+DB_PATH = Path(os.getenv("SIRA_DB_PATH", str(BASE_DIR / "sira_dados.db")))
+
+
+def configure_remote_storage(url, service_key):
+    """Configura Supabase para a publicação web; sem configuração usa SQLite local."""
+    global _supabase_config
+    _supabase_config = (url.strip(), service_key.strip())
+    _supabase_client.cache_clear()
+
+
+_supabase_config = None
+
+
+def _using_supabase():
+    return bool(_supabase_config or (os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY")))
+
+
+def remote_storage_enabled():
+    return _using_supabase()
+
+
+@lru_cache(maxsize=1)
+def _supabase_client():
+    config = _supabase_config or (os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+    if not config or not all(config):
+        raise RuntimeError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY nos segredos do app.")
+    from supabase import create_client
+    return create_client(*config)
 
 SEED_ALERTS = [
     ("Alagamento em área urbana (simulado)", "Enchente", "Alerta", "Campinas - SP", -22.9056, -47.0608,
@@ -48,6 +77,19 @@ def get_connection():
 
 
 def init_db():
+    if _using_supabase():
+        client = _supabase_client()
+        try:
+            existing = client.table("alerts").select("id", count="exact").limit(1).execute()
+            client.table("extension_participants").select("id", count="exact").limit(1).execute()
+            client.table("extension_feedbacks").select("id", count="exact").limit(1).execute()
+        except Exception as exc:
+            raise RuntimeError("Crie as tabelas no Supabase usando supabase_schema.sql.") from exc
+        if not existing.count:
+            fields = ("title", "risk_type", "severity", "location", "lat", "lng", "issuer", "description", "instructions", "date_time")
+            client.table("alerts").insert([dict(zip(fields, row)) for row in SEED_ALERTS]).execute()
+        return
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_connection() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript("""
@@ -78,10 +120,15 @@ def init_db():
                 participant_name TEXT NOT NULL,
                 usability_rating INTEGER NOT NULL CHECK (usability_rating BETWEEN 1 AND 5),
                 clarity_rating INTEGER NOT NULL CHECK (clarity_rating BETWEEN 1 AND 5),
+                persona TEXT NOT NULL DEFAULT 'Público geral' CHECK (persona IN ('Operador', 'Público geral')),
                 comments TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
+        # Migração compatível com bancos criados em versões anteriores.
+        feedback_columns = {row[1] for row in conn.execute("PRAGMA table_info(extension_feedbacks)")}
+        if "persona" not in feedback_columns:
+            conn.execute("ALTER TABLE extension_feedbacks ADD COLUMN persona TEXT NOT NULL DEFAULT 'Público geral'")
         count = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
         if count == 0:
             conn.executemany("""INSERT INTO alerts
@@ -90,6 +137,14 @@ def init_db():
 
 
 def list_alerts(risk_type="Todos", severity="Todas"):
+    if _using_supabase():
+        query = _supabase_client().table("alerts").select("*")
+        if risk_type and risk_type != "Todos":
+            query = query.eq("risk_type", risk_type)
+        if severity and severity != "Todas":
+            query = query.eq("severity", severity)
+        response = query.order("date_time", desc=True).order("id", desc=True).execute()
+        return response.data or []
     query = "SELECT * FROM alerts WHERE 1=1"
     params = []
     if risk_type and risk_type != "Todos":
@@ -104,6 +159,9 @@ def list_alerts(risk_type="Todos", severity="Todas"):
 
 
 def insert_alert(data):
+    if _using_supabase():
+        response = _supabase_client().table("alerts").insert(data).select().single().execute()
+        return response.data
     fields = ("title", "risk_type", "severity", "location", "lat", "lng", "issuer", "description", "instructions", "date_time")
     with get_connection() as conn:
         cur = conn.execute(
@@ -115,6 +173,9 @@ def insert_alert(data):
 
 
 def register_participant(data):
+    if _using_supabase():
+        response = _supabase_client().table("extension_participants").insert(data).select("id").single().execute()
+        return response.data["id"]
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO extension_participants (name, email, organization, role) VALUES (?, ?, ?, ?)",
@@ -124,15 +185,29 @@ def register_participant(data):
 
 
 def insert_feedback(data):
+    if _using_supabase():
+        response = _supabase_client().table("extension_feedbacks").insert(data).select("id").single().execute()
+        return response.data["id"]
     with get_connection() as conn:
         cur = conn.execute(
-            "INSERT INTO extension_feedbacks (participant_name, usability_rating, clarity_rating, comments) VALUES (?, ?, ?, ?)",
-            (data["participant_name"], data["usability_rating"], data["clarity_rating"], data["comments"]),
+            "INSERT INTO extension_feedbacks (participant_name, usability_rating, clarity_rating, persona, comments) VALUES (?, ?, ?, ?, ?)",
+            (data["participant_name"], data["usability_rating"], data["clarity_rating"], data["persona"], data["comments"]),
         )
         return cur.lastrowid
 
 
 def get_indicators():
+    if _using_supabase():
+        rows = list_alerts()
+        total = len(rows)
+        emergencies = sum(row["severity"] == "Emergência" for row in rows)
+        risk_counts, severity_counts = {}, {}
+        for row in rows:
+            risk_counts[row["risk_type"]] = risk_counts.get(row["risk_type"], 0) + 1
+            severity_counts[row["severity"]] = severity_counts.get(row["severity"], 0) + 1
+        by_risk = [{"risk_type": key, "total": value} for key, value in sorted(risk_counts.items(), key=lambda item: (-item[1], item[0]))]
+        by_severity = [{"severity": key, "total": value} for key, value in sorted(severity_counts.items(), key=lambda item: (-item[1], item[0]))]
+        return {"total_alerts": total, "emergency_alerts": emergencies, "risk_types": len(by_risk), "by_risk": by_risk, "by_severity": by_severity}
     with get_connection() as conn:
         total = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
         emergencies = conn.execute("SELECT COUNT(*) FROM alerts WHERE severity = 'Emergência'").fetchone()[0]
