@@ -84,6 +84,7 @@ def init_db():
             client.table("extension_participants").select("id", count="exact").limit(1).execute()
             client.table("extension_feedbacks").select("id", count="exact").limit(1).execute()
         except Exception as exc:
+            print(f"SUPABASE_INIT_ERROR: {type(exc).__name__}: {exc!r}")
             raise RuntimeError("Crie as tabelas no Supabase usando supabase_schema.sql.") from exc
         if not existing.count:
             fields = ("title", "risk_type", "severity", "location", "lat", "lng", "issuer", "description", "instructions", "date_time")
